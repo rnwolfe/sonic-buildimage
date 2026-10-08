@@ -1,4 +1,4 @@
-From d4043776d7ee809ff4e135d5324678acafd91e6f Mon Sep 17 00:00:00 2001
+From 7e60bfcb4f94b68de2c2e9ad9e8c527d7ab9c793 Mon Sep 17 00:00:00 2001
 From: Ryan Wolfe <rnwolfe@google.com>
 Date: Thu, 8 Oct 2026 10:15:27 -0400
 Subject: [PATCH] bgpd: resolve EVPN gateway IPs against local and symmetric
@@ -39,6 +39,13 @@ added. bgp_evpn_remote_ip_process_nexthops() is now only used when the
 EVI's SVI or VRF changes or the EVI goes away, and also acts on gateways
 resolved over the L3VNI SVI.
 
+"enable-resolve-overlay-index" also gets configured while the routes
+already exist, which is how it reaches running switches. Its set handler
+only filled the remote IP hash, so a gateway known from a local MAC/IP
+route stayed unresolved until that route changed. The set handler now
+re-evaluates the gateway for every MAC/IP route of the EVI, and the unset
+handler unresolves the gateways known from local MAC/IP routes too.
+
 delete_all_vni_routes() unlinked paths from the remote IP hash in its MAC
 table loop, where the MAC-only routes are never in the hash, so a VNI
 going down left freed paths in it. Unlink them in the IP table loop.
@@ -51,21 +58,23 @@ On 10.5 this needs the previous commit (FRRouting/frr ae614f4871):
 without it evaluate_paths() does not run bestpath when only the gateway's
 MAC/IP state changes, so the path turns valid but is never selected.
 
-tests/topotests/bgp_evpn_overlay_index_gateway_irb checks that a receiver
-installs a type-5 route through its gateway when the gateway is a local
-host and when it is a remote host behind a symmetric IRB host route, for
-IPv4 and IPv6, and that the route follows the host being forgotten and
-learnt again. Those checks fail without this change. bgp_evpn_rt5,
-bgp_evpn_rt5_addpath, bgp_evpn_vxlan_topo1, bgp_evpn_vxlan_svd_topo1,
+tests/topotests/bgp_evpn_overlay_index_gateway_irb checks that receivers
+over eBGP and iBGP install a type-5 route through its gateway when the
+gateway is a local host and when it is a remote host behind a symmetric
+IRB host route, for IPv4 and IPv6, also when
+"enable-resolve-overlay-index" is configured after the routes exist, and
+that the route follows the host being forgotten and learnt again. Those
+checks fail without this change. bgp_evpn_rt5, bgp_evpn_rt5_addpath,
+bgp_evpn_vxlan_topo1, bgp_evpn_vxlan_svd_topo1,
 bgp_evpn_vxlan_macvrf_soo_topo1 and bgp_evpn_mh pass.
 
 Signed-off-by: Ryan Wolfe <rnwolfe@google.com>
 ---
- bgpd/bgp_evpn.c | 195 ++++++++++++++++++++++++++++++++++++++----------
- 1 file changed, 154 insertions(+), 41 deletions(-)
+ bgpd/bgp_evpn.c | 218 ++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 175 insertions(+), 43 deletions(-)
 
 diff --git a/bgpd/bgp_evpn.c b/bgpd/bgp_evpn.c
-index 446e5134b0..1ba95791f2 100644
+index 446e5134b0..f1f6872389 100644
 --- a/bgpd/bgp_evpn.c
 +++ b/bgpd/bgp_evpn.c
 @@ -73,6 +73,7 @@ static bool vni_svi_hash_cmp(const void *p1, const void *p2);
@@ -320,18 +329,19 @@ index 446e5134b0..1ba95791f2 100644
 +	bool resolved;
 +
 +	if (!evpn_resolve_overlay_index() || !vpn->bgp_vrf)
-+		return;
-+
-+	if (evp->prefix.route_type != BGP_EVPN_MAC_IP_ROUTE || is_evpn_prefix_ipaddr_none(evp))
  		return;
  
 -	tree = &vpn->bgp_vrf->nexthop_cache_table[afi];
 -	bnc = bnc_find(tree, &p, 0, 0);
-+	bnc = bgp_evpn_gateway_ip_bnc_find(vpn->bgp_vrf, &evp->prefix.macip_addr.ip);
-+	if (!bnc)
++	if (evp->prefix.route_type != BGP_EVPN_MAC_IP_ROUTE || is_evpn_prefix_ipaddr_none(evp))
 +		return;
  
 -	if (!bnc || !bnc->is_evpn_gwip_nexthop)
++	bnc = bgp_evpn_gateway_ip_bnc_find(vpn->bgp_vrf, &evp->prefix.macip_addr.ip);
++	if (!bnc)
+ 		return;
+ 
+-	if (!bnc->nexthop || bnc->nexthop->ifindex != vpn->svi_ifindex)
 +	resolved = bgp_evpn_is_gateway_ip_resolved(bnc);
 +
 +	if (resolved && CHECK_FLAG(bnc->flags, BGP_NEXTHOP_EVPN_INCOMPLETE)) {
@@ -341,9 +351,8 @@ index 446e5134b0..1ba95791f2 100644
 +		UNSET_FLAG(bnc->flags, BGP_NEXTHOP_VALID);
 +		SET_FLAG(bnc->flags, BGP_NEXTHOP_EVPN_INCOMPLETE);
 +	} else
- 		return;
- 
--	if (!bnc->nexthop || bnc->nexthop->ifindex != vpn->svi_ifindex)
++		return;
++
 +	if (BGP_DEBUG(nht, NHT))
 +		zlog_debug("%s(%u): vni %u mac/ip change, NH %pFX %s", vpn->bgp_vrf->name_pretty,
 +			   vpn->tenant_vrf_id, vpn->vni, &bnc->prefix,
@@ -380,6 +389,51 @@ index 446e5134b0..1ba95791f2 100644
  		return;
  
  	if (BGP_DEBUG(nht, NHT))
+@@ -8055,23 +8168,42 @@ void bgp_evpn_handle_resolve_overlay_index_set(struct hash_bucket *bucket,
+ 					       void *arg)
+ {
+ 	struct bgpevpn *vpn = (struct bgpevpn *)bucket->data;
++	const struct prefix_evpn *evp;
+ 	struct bgp_dest *dest;
+ 	struct bgp_path_info *pi;
+ 
+ 	bgp_evpn_remote_ip_hash_init(vpn);
+ 
+-	for (dest = bgp_table_top(vpn->ip_table); dest;
+-	     dest = bgp_route_next(dest))
++	for (dest = bgp_table_top(vpn->ip_table); dest; dest = bgp_route_next(dest)) {
+ 		for (pi = bgp_dest_get_bgp_path_info(dest); pi; pi = pi->next)
+ 			bgp_evpn_remote_ip_hash_add(vpn, pi);
++
++		/* The gateway IP may be known from a local MAC/IP route */
++		evp = (const struct prefix_evpn *)bgp_dest_get_prefix(dest);
++		bgp_evpn_gateway_ip_reevaluate(vpn, evp);
++	}
+ }
+ 
+ void bgp_evpn_handle_resolve_overlay_index_unset(struct hash_bucket *bucket,
+ 						 void *arg)
+ {
+ 	struct bgpevpn *vpn = (struct bgpevpn *)bucket->data;
++	const struct prefix_evpn *evp;
++	struct bgp_dest *dest;
++	struct ipaddr ip;
+ 
+ 	bgp_evpn_remote_ip_hash_destroy(vpn);
++
++	/* Unresolve the gateway IPs known from local MAC/IP routes too */
++	for (dest = bgp_table_top(vpn->ip_table); dest; dest = bgp_route_next(dest)) {
++		evp = (const struct prefix_evpn *)bgp_dest_get_prefix(dest);
++		if (evp->prefix.route_type != BGP_EVPN_MAC_IP_ROUTE ||
++		    is_evpn_prefix_ipaddr_none(evp))
++			continue;
++
++		ip = evp->prefix.macip_addr.ip;
++		bgp_evpn_remote_ip_process_nexthops(vpn, &ip, false);
++	}
+ }
+ 
+ /*
 -- 
-2.56.0.360.g66cac248cb-goog
+2.56.0.385.gd3acb90ef8-goog
 
