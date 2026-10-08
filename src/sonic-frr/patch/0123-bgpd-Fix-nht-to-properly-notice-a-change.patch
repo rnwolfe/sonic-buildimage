@@ -1,0 +1,36 @@
+From dee5d77d57e270f0ded65472e07cad56fabac7cd Mon Sep 17 00:00:00 2001
+From: Donald Sharp <sharpd@nvidia.com>
+Date: Mon, 2 Mar 2026 20:05:26 -0500
+Subject: [PATCH] bgpd: Fix nht to properly notice a change
+
+commit: 8dcd0a6b9cdbfac47eea2cf2100badf7744dbf98 broke
+path handling in some rare cases.  This can be especially
+seen in bgp evpn processing when a path transitions from !valid
+to valid.  The bgp_evpn_rt5_addpath code is failing occassionally
+because of this change.  Modify the code to intentionally also
+call bgp_process when the old_path_valid is not the same
+as the new path being valid.
+
+Signed-off-by: Donald Sharp <sharpd@nvidia.com>
+(cherry picked from commit ae614f4871bad923733e46b76ad600209d0efdc9)
+---
+ bgpd/bgp_nht.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/bgpd/bgp_nht.c b/bgpd/bgp_nht.c
+index ea517f0287..3935665b94 100644
+--- a/bgpd/bgp_nht.c
++++ b/bgpd/bgp_nht.c
+@@ -1514,7 +1514,8 @@ void evaluate_paths(struct bgp_nexthop_cache *bnc)
+ 		if (old_path_valid != bnc_is_valid_nexthop)
+ 			hook_call(bgp_nht_path_update, bgp_path, path, bnc_is_valid_nexthop);
+ 
+-		if (CHECK_FLAG(bnc->change_flags, BGP_NEXTHOP_METRIC_CHANGED) ||
++		if (old_path_valid != bnc_is_valid_nexthop ||
++		    CHECK_FLAG(bnc->change_flags, BGP_NEXTHOP_METRIC_CHANGED) ||
+ 		    CHECK_FLAG(bnc->change_flags, BGP_NEXTHOP_CHANGED))
+ 			bgp_process(bgp_path, dest, path, afi, safi);
+ 	}
+-- 
+2.56.0.360.g66cac248cb-goog
+
