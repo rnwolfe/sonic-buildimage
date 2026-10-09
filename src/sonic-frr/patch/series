@@ -94,3 +94,4 @@
 0123-bgpd-Fix-nht-to-properly-notice-a-change.patch
 0124-bgpd-resolve-EVPN-gateway-IPs-against-local-and-symmetric-IRB-hosts.patch
 0125-bgpd-install-one-VNI-per-VTEP-for-an-EVPN-multipath.patch
+0126-bgpd-send-no-label-with-an-EVPN-gateway-IP-nexthop.patch

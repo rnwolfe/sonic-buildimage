@@ -1,0 +1,66 @@
+From ff46de9df13ab9ef8fc69397814a3129f06bceb7 Mon Sep 17 00:00:00 2001
+From: Ryan Wolfe <rnwolfe@google.com>
+Date: Thu, 8 Oct 2026 21:31:18 -0400
+Subject: [PATCH] bgpd: send no label with an EVPN gateway IP nexthop
+
+A path imported from an EVPN route carries the VNI as its label, in the
+3-octet EVPN encoding. bgp_zebra_announce_parse_nexthop() sends it to
+zebra as the VNI when the nexthop is an EVPN one (ZAPI_NEXTHOP_FLAG_EVPN),
+and as an MPLS label when bgp_is_valid_label() says it is one. A path
+with a gateway IP overlay index (RFC 9136) is not sent with an EVPN
+nexthop: its nexthop is the gateway, which zebra resolves recursively.
+Its label still holds the VNI, and bgp_is_valid_label() only checks bit 1
+of the last octet, which is the low octet of the VNI. For a VNI with that
+bit set, such as 2234, the gateway nexthop goes to zebra with MPLS label
+VNI >> 4 (139 for 2234).
+
+zebra keeps that label on the nexthop and on the nexthops it resolves to.
+When the gateway is a host on a connected subnet, the kernel route gets
+an MPLS encapsulation it should not have, and the route sent to an FPM
+does too. SONiC's fpmsyncd takes a route with an encapsulation for an
+EVPN route, finds no VXLAN VNI and router MAC in it and drops it, so
+ROUTE_TABLE keeps whatever the prefix had before, typically the type-5
+route through the VTEP that exported it. The gateway's VTEP then sends
+the traffic back to that VTEP, which sends it to the gateway's VTEP
+again. When the gateway is behind another VTEP, the nexthop also gets the
+VXLAN encapsulation of its host route, which the FPM receives after the
+MPLS one, so that case only worked by accident.
+
+Send no label with a gateway IP nexthop: the label of an EVPN path is a
+VNI and only goes with an EVPN nexthop. The route to the gateway provides
+the encapsulation the gateway needs, none for a local host and the VTEP's
+VNI and router MAC for a host behind another VTEP.
+
+bgp_evpn_overlay_index_gateway_irb checks this with the FPM listener on
+an L3VNI with bit 1 set: the route through a local gateway reaches the
+FPM as a plain nexthop on the L2VNI SVI, and the route through a remote
+gateway with the VTEP, the L3VNI and its router MAC.
+
+Signed-off-by: Ryan Wolfe <rnwolfe@google.com>
+---
+ bgpd/bgp_zebra.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/bgpd/bgp_zebra.c b/bgpd/bgp_zebra.c
+index 9e3f088f8d..3d588593b5 100644
+--- a/bgpd/bgp_zebra.c
++++ b/bgpd/bgp_zebra.c
+@@ -1444,7 +1444,14 @@ static void bgp_zebra_announce_parse_nexthop(
+ 		num_labels = BGP_PATH_INFO_NUM_LABELS(mpinfo);
+ 		labels = num_labels ? mpinfo->extra->labels->label : NULL;
+ 
+-		if (num_labels && (is_evpn || bgp_is_valid_label(&labels[0]))) {
++		/*
++		 * The label of a path imported from EVPN is a VNI, which only
++		 * goes with an EVPN nexthop. A gateway IP overlay index nexthop
++		 * has no label: zebra resolves it through the route to the
++		 * gateway, which brings its own encapsulation if it needs one.
++		 */
++		if (num_labels &&
++		    (is_evpn || (!is_parent_evpn && bgp_is_valid_label(&labels[0])))) {
+ 			enum lsp_types_t nh_label_type = ZEBRA_LSP_NONE;
+ 
+ 			if (is_evpn) {
+-- 
+2.56.0.385.gd3acb90ef8-goog
+
