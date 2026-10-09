@@ -1,4 +1,4 @@
-From 7e60bfcb4f94b68de2c2e9ad9e8c527d7ab9c793 Mon Sep 17 00:00:00 2001
+From c41256cb7a01650a27743ec526756db253ed3730 Mon Sep 17 00:00:00 2001
 From: Ryan Wolfe <rnwolfe@google.com>
 Date: Thu, 8 Oct 2026 10:15:27 -0400
 Subject: [PATCH] bgpd: resolve EVPN gateway IPs against local and symmetric
@@ -37,14 +37,18 @@ another route still knows it, for example when a host moves from a remote
 VTEP to this one and the remote route is withdrawn after the local one is
 added. bgp_evpn_remote_ip_process_nexthops() is now only used when the
 EVI's SVI or VRF changes or the EVI goes away, and also acts on gateways
-resolved over the L3VNI SVI.
+resolved over the L3VNI SVI. Such a gateway stays resolved while another
+EVI of the VRF still knows it, which is the rule
+bgp_evpn_is_gateway_ip_resolved() applies.
 
 "enable-resolve-overlay-index" also gets configured while the routes
 already exist, which is how it reaches running switches. Its set handler
 only filled the remote IP hash, so a gateway known from a local MAC/IP
 route stayed unresolved until that route changed. The set handler now
 re-evaluates the gateway for every MAC/IP route of the EVI, and the unset
-handler unresolves the gateways known from local MAC/IP routes too.
+handler unresolves the gateways known from local MAC/IP routes too. It
+passes a new force argument so that every gateway is unresolved, also one
+that another EVI still knows.
 
 delete_all_vni_routes() unlinked paths from the remote IP hash in its MAC
 table loop, where the MAC-only routes are never in the hash, so a VNI
@@ -62,30 +66,45 @@ tests/topotests/bgp_evpn_overlay_index_gateway_irb checks that receivers
 over eBGP and iBGP install a type-5 route through its gateway when the
 gateway is a local host and when it is a remote host behind a symmetric
 IRB host route, for IPv4 and IPv6, also when
-"enable-resolve-overlay-index" is configured after the routes exist, and
-that the route follows the host being forgotten and learnt again. Those
-checks fail without this change. bgp_evpn_rt5, bgp_evpn_rt5_addpath,
+"enable-resolve-overlay-index" is configured after the routes exist, that
+the route follows the host being forgotten and learnt again, and that it
+stays when a second L2VNI that also knows the gateway leaves the VRF.
+Those checks fail without this change. bgp_evpn_rt5, bgp_evpn_rt5_addpath,
 bgp_evpn_vxlan_topo1, bgp_evpn_vxlan_svd_topo1,
 bgp_evpn_vxlan_macvrf_soo_topo1 and bgp_evpn_mh pass.
 
 Signed-off-by: Ryan Wolfe <rnwolfe@google.com>
 ---
- bgpd/bgp_evpn.c | 218 ++++++++++++++++++++++++++++++++++++++----------
- 1 file changed, 175 insertions(+), 43 deletions(-)
+ bgpd/bgp_evpn.c | 285 ++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 229 insertions(+), 56 deletions(-)
 
 diff --git a/bgpd/bgp_evpn.c b/bgpd/bgp_evpn.c
-index 446e5134b0..f1f6872389 100644
+index 446e5134b0..165b355e67 100644
 --- a/bgpd/bgp_evpn.c
 +++ b/bgpd/bgp_evpn.c
-@@ -73,6 +73,7 @@ static bool vni_svi_hash_cmp(const void *p1, const void *p2);
- static void bgp_evpn_remote_ip_process_nexthops(struct bgpevpn *vpn,
- 						struct ipaddr *addr,
- 						bool resolve);
+@@ -56,7 +56,7 @@ DEFINE_MTYPE_STATIC(BGPD, VRF_ROUTE_TARGET, "L3 Route Target");
+  * Static function declarations
+  */
+ static void bgp_evpn_remote_ip_hash_init(struct bgpevpn *evpn);
+-static void bgp_evpn_remote_ip_hash_destroy(struct bgpevpn *evpn);
++static void bgp_evpn_remote_ip_hash_destroy(struct bgpevpn *evpn, bool force);
+ static void bgp_evpn_remote_ip_hash_add(struct bgpevpn *vpn,
+ 					struct bgp_path_info *pi);
+ static void bgp_evpn_remote_ip_hash_del(struct bgpevpn *vpn,
+@@ -70,9 +70,9 @@ static void bgp_evpn_unlink_from_vni_svi_hash(struct bgp *bgp,
+ 					      struct bgpevpn *vpn);
+ static unsigned int vni_svi_hash_key_make(const void *p);
+ static bool vni_svi_hash_cmp(const void *p1, const void *p2);
+-static void bgp_evpn_remote_ip_process_nexthops(struct bgpevpn *vpn,
+-						struct ipaddr *addr,
+-						bool resolve);
++static void bgp_evpn_remote_ip_process_nexthops(struct bgpevpn *vpn, struct ipaddr *addr,
++						bool resolve, bool force);
 +static void bgp_evpn_gateway_ip_reevaluate(struct bgpevpn *vpn, const struct prefix_evpn *evp);
  static void bgp_evpn_remote_ip_hash_link_nexthop(struct hash_bucket *bucket,
  						 void *args);
  static void bgp_evpn_remote_ip_hash_unlink_nexthop(struct hash_bucket *bucket,
-@@ -2416,6 +2417,9 @@ static int update_evpn_route(struct bgp *bgp, struct bgpevpn *vpn,
+@@ -2416,6 +2416,9 @@ static int update_evpn_route(struct bgp *bgp, struct bgpevpn *vpn,
  	if (dest)
  		bgp_dest_unlock_node(dest);
  
@@ -95,7 +114,7 @@ index 446e5134b0..f1f6872389 100644
  	/* If this is a new route or some attribute has changed, export the
  	 * route to the global table. The route will be advertised to peers
  	 * from there. Note that this table is a 2-level tree (RD-level +
-@@ -2541,6 +2545,9 @@ static int delete_evpn_route(struct bgp *bgp, struct bgpevpn *vpn,
+@@ -2541,6 +2544,9 @@ static int delete_evpn_route(struct bgp *bgp, struct bgpevpn *vpn,
  	assert(dest);
  	bgp_dest_unlock_node(dest);
  
@@ -105,7 +124,7 @@ index 446e5134b0..f1f6872389 100644
  	return 0;
  }
  
-@@ -2805,6 +2812,7 @@ static struct bgp_dest *delete_vni_type2_route(struct bgp *bgp,
+@@ -2805,6 +2811,7 @@ static struct bgp_dest *delete_vni_type2_route(struct bgp *bgp,
  static void delete_vni_type2_routes(struct bgp *bgp, struct bgpevpn *vpn)
  {
  	struct bgp_dest *dest;
@@ -113,7 +132,7 @@ index 446e5134b0..f1f6872389 100644
  
  	/* Next, walk this VNI's MAC & IP route table and delete local type-2
  	 * routes.
-@@ -2819,6 +2827,8 @@ static void delete_vni_type2_routes(struct bgp *bgp, struct bgpevpn *vpn)
+@@ -2819,6 +2826,8 @@ static void delete_vni_type2_routes(struct bgp *bgp, struct bgpevpn *vpn)
  	     dest = bgp_route_next(dest)) {
  		dest = delete_vni_type2_route(bgp, dest);
  		assert(dest);
@@ -122,7 +141,7 @@ index 446e5134b0..f1f6872389 100644
  	}
  }
  
-@@ -2849,7 +2859,6 @@ static void delete_all_vni_routes(struct bgp *bgp, struct bgpevpn *vpn)
+@@ -2849,7 +2858,6 @@ static void delete_all_vni_routes(struct bgp *bgp, struct bgpevpn *vpn)
  	     dest = bgp_route_next(dest)) {
  		for (pi = bgp_dest_get_bgp_path_info(dest);
  		     (pi != NULL) && (nextpi = pi->next, 1); pi = nextpi) {
@@ -130,7 +149,7 @@ index 446e5134b0..f1f6872389 100644
  			bgp_path_info_mark_for_delete(dest, pi);
  			dest = bgp_path_info_reap(dest, pi);
  
-@@ -2861,6 +2870,7 @@ static void delete_all_vni_routes(struct bgp *bgp, struct bgpevpn *vpn)
+@@ -2861,6 +2869,7 @@ static void delete_all_vni_routes(struct bgp *bgp, struct bgpevpn *vpn)
  	     dest = bgp_route_next(dest)) {
  		for (pi = bgp_dest_get_bgp_path_info(dest);
  		     (pi != NULL) && (nextpi = pi->next, 1); pi = nextpi) {
@@ -138,7 +157,60 @@ index 446e5134b0..f1f6872389 100644
  			bgp_path_info_mark_for_delete(dest, pi);
  			dest = bgp_path_info_reap(dest, pi);
  
-@@ -7782,7 +7792,7 @@ static void bgp_evpn_remote_ip_hash_add(struct bgpevpn *vpn,
+@@ -6573,7 +6582,7 @@ struct bgpevpn *bgp_evpn_new(struct bgp *bgp, vni_t vni,
+  */
+ void bgp_evpn_free(struct bgp *bgp, struct bgpevpn *vpn)
+ {
+-	bgp_evpn_remote_ip_hash_destroy(vpn);
++	bgp_evpn_remote_ip_hash_destroy(vpn, false);
+ 	bgp_evpn_vni_es_cleanup(vpn);
+ 	bgpevpn_unlink_from_l3vni(vpn);
+ 	bgp_table_unlock(vpn->ip_table);
+@@ -7722,12 +7731,18 @@ static void bgp_evpn_remote_ip_hash_init(struct bgpevpn *vpn)
+ 					  "BGP EVPN remote IP hash");
+ }
+ 
++struct evpn_remote_ip_free_args {
++	struct bgpevpn *vpn;
++	bool force;
++};
++
+ static void bgp_evpn_remote_ip_hash_free(struct hash_bucket *bucket, void *args)
+ {
+ 	struct evpn_remote_ip *ip = (struct evpn_remote_ip *)bucket->data;
+-	struct bgpevpn *vpn = (struct bgpevpn *)args;
++	struct evpn_remote_ip_free_args *free_args = args;
++	struct bgpevpn *vpn = free_args->vpn;
+ 
+-	bgp_evpn_remote_ip_process_nexthops(vpn, &ip->addr, false);
++	bgp_evpn_remote_ip_process_nexthops(vpn, &ip->addr, false, free_args->force);
+ 
+ 	list_delete(&ip->macip_path_list);
+ 
+@@ -7735,14 +7750,19 @@ static void bgp_evpn_remote_ip_hash_free(struct hash_bucket *bucket, void *args)
+ 	XFREE(MTYPE_EVPN_REMOTE_IP, ip);
+ }
+ 
+-static void bgp_evpn_remote_ip_hash_destroy(struct bgpevpn *vpn)
++/*
++ * Free the remote IP hash of the EVI, unresolving the gateway IP nexthops it
++ * resolved. With force, unresolve them even if another EVI still knows them.
++ */
++static void bgp_evpn_remote_ip_hash_destroy(struct bgpevpn *vpn, bool force)
+ {
++	struct evpn_remote_ip_free_args args = { .vpn = vpn, .force = force };
++
+ 	if (!evpn_resolve_overlay_index() || vpn->remote_ip_hash == NULL)
+ 		return;
+ 
+ 	hash_iterate(vpn->remote_ip_hash,
+-	(void (*)(struct hash_bucket *, void *))bgp_evpn_remote_ip_hash_free,
+-	vpn);
++		     (void (*)(struct hash_bucket *, void *))bgp_evpn_remote_ip_hash_free, &args);
+ 
+ 	hash_free(vpn->remote_ip_hash);
+ 	vpn->remote_ip_hash = NULL;
+@@ -7782,7 +7802,7 @@ static void bgp_evpn_remote_ip_hash_add(struct bgpevpn *vpn,
  	ip = hash_get(vpn->remote_ip_hash, &tmp, bgp_evpn_remote_ip_hash_alloc);
  	(void)listnode_add(ip->macip_path_list, pi);
  
@@ -147,7 +219,7 @@ index 446e5134b0..f1f6872389 100644
  }
  
  /* Delete a remote MAC/IP route from hash table */
-@@ -7811,10 +7821,10 @@ static void bgp_evpn_remote_ip_hash_del(struct bgpevpn *vpn,
+@@ -7811,10 +7831,10 @@ static void bgp_evpn_remote_ip_hash_del(struct bgpevpn *vpn,
  	listnode_delete(ip->macip_path_list, pi);
  
  	if (ip->macip_path_list->count == 0) {
@@ -159,7 +231,25 @@ index 446e5134b0..f1f6872389 100644
  	}
  }
  
-@@ -7927,17 +7937,59 @@ void bgp_evpn_show_vni_svi_hash(struct hash_bucket *bucket, void *args)
+@@ -7863,7 +7883,7 @@ static void bgp_evpn_remote_ip_hash_link_nexthop(struct hash_bucket *bucket,
+ 	struct evpn_remote_ip *ip = (struct evpn_remote_ip *)bucket->data;
+ 	struct bgpevpn *vpn = (struct bgpevpn *)args;
+ 
+-	bgp_evpn_remote_ip_process_nexthops(vpn, &ip->addr, true);
++	bgp_evpn_remote_ip_process_nexthops(vpn, &ip->addr, true, false);
+ }
+ 
+ static void bgp_evpn_remote_ip_hash_unlink_nexthop(struct hash_bucket *bucket,
+@@ -7872,7 +7892,7 @@ static void bgp_evpn_remote_ip_hash_unlink_nexthop(struct hash_bucket *bucket,
+ 	struct evpn_remote_ip *ip = (struct evpn_remote_ip *)bucket->data;
+ 	struct bgpevpn *vpn = (struct bgpevpn *)args;
+ 
+-	bgp_evpn_remote_ip_process_nexthops(vpn, &ip->addr, false);
++	bgp_evpn_remote_ip_process_nexthops(vpn, &ip->addr, false, false);
+ }
+ 
+ static unsigned int vni_svi_hash_key_make(const void *p)
+@@ -7927,17 +7947,59 @@ void bgp_evpn_show_vni_svi_hash(struct hash_bucket *bucket, void *args)
  	vty_out(vty, "SVI: %u VNI: %u\n", evpn->svi_ifindex, evpn->vni);
  }
  
@@ -222,7 +312,7 @@ index 446e5134b0..f1f6872389 100644
  	struct prefix *p;
  
  	if (!evpn_resolve_overlay_index())
-@@ -7950,54 +8002,50 @@ bool bgp_evpn_is_gateway_ip_resolved(struct bgp_nexthop_cache *bnc)
+@@ -7950,54 +8012,50 @@ bool bgp_evpn_is_gateway_ip_resolved(struct bgp_nexthop_cache *bnc)
  	if (!bgp_evpn)
  		return false;
  
@@ -304,10 +394,11 @@ index 446e5134b0..f1f6872389 100644
  
  	memset(&p, 0, sizeof(p));
  
-@@ -8014,15 +8062,80 @@ static void bgp_evpn_remote_ip_process_nexthops(struct bgpevpn *vpn,
+@@ -8013,16 +8071,112 @@ static void bgp_evpn_remote_ip_process_nexthops(struct bgpevpn *vpn,
+ 		memcpy(&(p.u.prefix6), &(addr->ipaddr_v6),
  		       sizeof(struct in6_addr));
  		p.prefixlen = IPV6_MAX_BITLEN;
- 	} else
++	} else
 +		return NULL;
 +
 +	bnc = bnc_find(&bgp_vrf->nexthop_cache_table[afi], &p, 0, 0);
@@ -329,19 +420,15 @@ index 446e5134b0..f1f6872389 100644
 +	bool resolved;
 +
 +	if (!evpn_resolve_overlay_index() || !vpn->bgp_vrf)
- 		return;
- 
--	tree = &vpn->bgp_vrf->nexthop_cache_table[afi];
--	bnc = bnc_find(tree, &p, 0, 0);
++		return;
++
 +	if (evp->prefix.route_type != BGP_EVPN_MAC_IP_ROUTE || is_evpn_prefix_ipaddr_none(evp))
 +		return;
- 
--	if (!bnc || !bnc->is_evpn_gwip_nexthop)
++
 +	bnc = bgp_evpn_gateway_ip_bnc_find(vpn->bgp_vrf, &evp->prefix.macip_addr.ip);
 +	if (!bnc)
- 		return;
- 
--	if (!bnc->nexthop || bnc->nexthop->ifindex != vpn->svi_ifindex)
++		return;
++
 +	resolved = bgp_evpn_is_gateway_ip_resolved(bnc);
 +
 +	if (resolved && CHECK_FLAG(bnc->flags, BGP_NEXTHOP_EVPN_INCOMPLETE)) {
@@ -350,9 +437,11 @@ index 446e5134b0..f1f6872389 100644
 +	} else if (!resolved && CHECK_FLAG(bnc->flags, BGP_NEXTHOP_VALID)) {
 +		UNSET_FLAG(bnc->flags, BGP_NEXTHOP_VALID);
 +		SET_FLAG(bnc->flags, BGP_NEXTHOP_EVPN_INCOMPLETE);
-+	} else
-+		return;
-+
+ 	} else
+ 		return;
+ 
+-	tree = &vpn->bgp_vrf->nexthop_cache_table[afi];
+-	bnc = bnc_find(tree, &p, 0, 0);
 +	if (BGP_DEBUG(nht, NHT))
 +		zlog_debug("%s(%u): vni %u mac/ip change, NH %pFX %s", vpn->bgp_vrf->name_pretty,
 +			   vpn->tenant_vrf_id, vpn->vni, &bnc->prefix,
@@ -361,20 +450,45 @@ index 446e5134b0..f1f6872389 100644
 +	SET_FLAG(bnc->change_flags, BGP_NEXTHOP_MACIP_CHANGED);
 +	evaluate_paths(bnc);
 +}
+ 
+-	if (!bnc || !bnc->is_evpn_gwip_nexthop)
++/*
++ * Check if the IP is a known host in an EVI of the tenant VRF other than
++ * exclude. That is enough to resolve a gateway IP reached over the L3VNI SVI,
++ * see bgp_evpn_is_gateway_ip_resolved().
++ */
++static bool bgp_evpn_ip_known_in_other_evi(struct bgp *bgp_vrf, const struct ipaddr *addr,
++					   const struct bgpevpn *exclude)
++{
++	struct bgp *bgp_evpn;
++	struct bgpevpn *vpn;
++	struct listnode *node;
++
++	bgp_evpn = bgp_get_evpn();
++	if (!bgp_evpn)
++		return false;
++
++	for (ALL_LIST_ELEMENTS_RO(bgp_vrf->l2vnis, node, vpn))
++		if (vpn != exclude && bgp_evpn_is_ip_known_in_vni(bgp_evpn, vpn, addr))
++			return true;
++
++	return false;
++}
 +
 +/*
 + * Resolve/Unresolve nexthops when the SVI or the tenant VRF of the EVI
-+ * changes, or when the EVI goes away.
++ * changes, or when the EVI goes away. With force, unresolve even a gateway IP
++ * that another EVI still knows, for when gateway IP resolution is turned off.
 + */
-+static void bgp_evpn_remote_ip_process_nexthops(struct bgpevpn *vpn,
-+						struct ipaddr *addr,
-+						bool resolve)
++static void bgp_evpn_remote_ip_process_nexthops(struct bgpevpn *vpn, struct ipaddr *addr,
++						bool resolve, bool force)
 +{
 +	struct bgp_nexthop_cache *bnc;
 +
 +	if (!vpn->bgp_vrf || vpn->svi_ifindex == 0)
-+		return;
-+
+ 		return;
+ 
+-	if (!bnc->nexthop || bnc->nexthop->ifindex != vpn->svi_ifindex)
 +	bnc = bgp_evpn_gateway_ip_bnc_find(vpn->bgp_vrf, addr);
 +	if (!bnc)
 +		return;
@@ -386,10 +500,18 @@ index 446e5134b0..f1f6872389 100644
 +	if (!bnc->nexthop || (bnc->nexthop->ifindex != vpn->svi_ifindex &&
 +			      (vpn->bgp_vrf->l3vni_svi_ifindex == 0 ||
 +			       bnc->nexthop->ifindex != vpn->bgp_vrf->l3vni_svi_ifindex)))
++		return;
++
++	/*
++	 * Over the L3VNI SVI, a MAC/IP route in any EVI of the VRF resolves the
++	 * gateway IP: keep it while another EVI still knows the IP.
++	 */
++	if (!resolve && !force && bnc->nexthop->ifindex != vpn->svi_ifindex &&
++	    bgp_evpn_ip_known_in_other_evi(vpn->bgp_vrf, addr, vpn))
  		return;
  
  	if (BGP_DEBUG(nht, NHT))
-@@ -8055,23 +8168,42 @@ void bgp_evpn_handle_resolve_overlay_index_set(struct hash_bucket *bucket,
+@@ -8055,23 +8209,42 @@ void bgp_evpn_handle_resolve_overlay_index_set(struct hash_bucket *bucket,
  					       void *arg)
  {
  	struct bgpevpn *vpn = (struct bgpevpn *)bucket->data;
@@ -419,7 +541,8 @@ index 446e5134b0..f1f6872389 100644
 +	struct bgp_dest *dest;
 +	struct ipaddr ip;
  
- 	bgp_evpn_remote_ip_hash_destroy(vpn);
+-	bgp_evpn_remote_ip_hash_destroy(vpn);
++	bgp_evpn_remote_ip_hash_destroy(vpn, true);
 +
 +	/* Unresolve the gateway IPs known from local MAC/IP routes too */
 +	for (dest = bgp_table_top(vpn->ip_table); dest; dest = bgp_route_next(dest)) {
@@ -429,7 +552,7 @@ index 446e5134b0..f1f6872389 100644
 +			continue;
 +
 +		ip = evp->prefix.macip_addr.ip;
-+		bgp_evpn_remote_ip_process_nexthops(vpn, &ip, false);
++		bgp_evpn_remote_ip_process_nexthops(vpn, &ip, false, true);
 +	}
  }
  
